@@ -20,6 +20,14 @@ type EnumType struct {
 	SQL     string
 }
 
+type ForeignKey struct {
+	SQL           string
+	FromTable     string
+	FromSchema    string
+	ToTable       string
+	ToSchema      string
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: go run script.go structure.sql [table_prefix] [whitelist_table1] [whitelist_table2] ...")
@@ -59,6 +67,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Rewind file for parsing foreign keys
+	file.Seek(0, 0)
+	foreignKeys, err := parseForeignKeys(file)
+	if err != nil {
+		fmt.Printf("Error parsing foreign keys: %v\n", err)
+		os.Exit(1)
+	}
+
 	fmt.Printf("Found %d total tables\n", len(tables))
 
 	if tablePrefix != "" {
@@ -94,6 +110,13 @@ func main() {
 		fmt.Printf("\nFound %d enum types used by filtered tables and whitelisted related tables:\n", len(usedEnums))
 		for _, enum := range usedEnums {
 			fmt.Printf("%s.%s\n", enum.Schema, enum.Name)
+		}
+
+		// Find relevant foreign keys
+		relevantFKs := findRelevantForeignKeys(filteredTables, relatedTables, whitelistTables, foreignKeys)
+		fmt.Printf("\nFound %d foreign key constraints for these tables:\n", len(relevantFKs))
+		for _, fk := range relevantFKs {
+			fmt.Printf("%s.%s -> %s.%s\n", fk.FromSchema, fk.FromTable, fk.ToSchema, fk.ToTable)
 		}
 
 		// Write filtered and related tables to output file
@@ -143,9 +166,18 @@ func main() {
 			}
 		}
 
-		fmt.Printf("\nWrote %d tables and %d enum types to %s\n",
+		// Write foreign key constraints
+		if len(relevantFKs) > 0 {
+			fmt.Fprint(out, "\n-- Foreign key constraints\n")
+			for _, fk := range relevantFKs {
+				fmt.Fprintln(out, fk.SQL)
+			}
+		}
+
+		fmt.Printf("\nWrote %d tables, %d enum types, and %d foreign key constraints to %s\n",
 			len(filteredTables)+len(relatedTables),
 			len(usedEnums),
+			len(relevantFKs),
 			outputFile)
 		if len(whitelistTables) > 0 {
 			fmt.Printf("Included full definitions for whitelisted tables: %v\n", whitelistTables)
@@ -366,6 +398,117 @@ func findUsedEnums(tables []Table, allEnums []EnumType) []EnumType {
 	var result []EnumType
 	for _, enum := range usedEnums {
 		result = append(result, enum)
+	}
+	return result
+}
+
+func parseForeignKeys(file *os.File) ([]ForeignKey, error) {
+	var foreignKeys []ForeignKey
+	scanner := bufio.NewScanner(file)
+
+	// Pattern to match ALTER TABLE ... DROP CONSTRAINT ... fk_rails_...
+	dropPattern := regexp.MustCompile(`ALTER TABLE IF EXISTS ONLY ([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+) DROP CONSTRAINT IF EXISTS (fk_rails_[a-zA-Z0-9_]+);`)
+
+	// Map to store constraint names and their corresponding tables
+	constraintMap := make(map[string]string)
+
+	// First pass: collect all constraint names and their tables
+	for scanner.Scan() {
+		line := scanner.Text()
+		if matches := dropPattern.FindStringSubmatch(line); len(matches) == 4 {
+			tableName := fmt.Sprintf("%s.%s", matches[1], matches[2])
+			constraintName := matches[3]
+			constraintMap[constraintName] = tableName
+		}
+	}
+
+	// Rewind file for second pass
+	file.Seek(0, 0)
+	scanner = bufio.NewScanner(file)
+
+	// Pattern to match REFERENCES in ALTER TABLE statements
+	refPattern := regexp.MustCompile(`REFERENCES ([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)`)
+
+	// Second pass: find the actual foreign key definitions
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, "ADD CONSTRAINT") && strings.Contains(line, "FOREIGN KEY") {
+			// Extract constraint name
+			parts := strings.Split(line, "ADD CONSTRAINT")
+			if len(parts) != 2 {
+				continue
+			}
+			constraintPart := strings.TrimSpace(parts[1])
+			constraintName := strings.Split(constraintPart, " ")[0]
+
+			// Get the source table from our constraint map
+			if fromTable, ok := constraintMap[constraintName]; ok {
+				fromParts := strings.Split(fromTable, ".")
+				if len(fromParts) != 2 {
+					continue
+				}
+
+				// Extract the referenced table
+				refMatches := refPattern.FindStringSubmatch(line)
+				if len(refMatches) == 3 {
+					fk := ForeignKey{
+						SQL:        line,
+						FromSchema: fromParts[0],
+						FromTable:  fromParts[1],
+						ToSchema:   refMatches[1],
+						ToTable:    refMatches[2],
+					}
+					foreignKeys = append(foreignKeys, fk)
+				}
+			}
+		}
+	}
+
+	return foreignKeys, scanner.Err()
+}
+
+func findRelevantForeignKeys(filteredTables []Table, relatedTables []Table, whitelistTables []string, allForeignKeys []ForeignKey) []ForeignKey {
+	relevantFKs := make(map[string]ForeignKey) // Use map to avoid duplicates
+
+	// Helper function to check if a table is whitelisted
+	isWhitelisted := func(schema, name string) bool {
+		for _, whitelist := range whitelistTables {
+			if strings.EqualFold(name, whitelist) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Helper function to check if a table is in a list
+	isTableInList := func(schema, name string, tables []Table) bool {
+		for _, t := range tables {
+			if strings.EqualFold(t.Schema, schema) && strings.EqualFold(t.Name, name) {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, fk := range allForeignKeys {
+		// Include FK if:
+		// 1. From filtered table to any table
+		// 2. From any table to filtered table
+		// 3. From whitelisted table to any table
+		// 4. From any table to whitelisted table
+		fromFiltered := isTableInList(fk.FromSchema, fk.FromTable, filteredTables)
+		toFiltered := isTableInList(fk.ToSchema, fk.ToTable, filteredTables)
+		fromWhitelisted := isWhitelisted(fk.FromSchema, fk.FromTable)
+		toWhitelisted := isWhitelisted(fk.ToSchema, fk.ToTable)
+
+		if fromFiltered || toFiltered || fromWhitelisted || toWhitelisted {
+			relevantFKs[fk.SQL] = fk
+		}
+	}
+
+	var result []ForeignKey
+	for _, fk := range relevantFKs {
+		result = append(result, fk)
 	}
 	return result
 }
