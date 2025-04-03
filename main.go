@@ -14,6 +14,12 @@ type Table struct {
 	SQL     string
 }
 
+type EnumType struct {
+	Name    string
+	Schema  string
+	SQL     string
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: go run script.go structure.sql [table_prefix] [whitelist_table1] [whitelist_table2] ...")
@@ -25,7 +31,6 @@ func main() {
 	var whitelistTables []string
 	if len(os.Args) > 2 {
 		tablePrefix = os.Args[2]
-		// Any additional arguments are treated as whitelisted tables
 		if len(os.Args) > 3 {
 			whitelistTables = os.Args[3:]
 		}
@@ -46,6 +51,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Rewind file for parsing enums
+	file.Seek(0, 0)
+	enums, err := parseEnums(file)
+	if err != nil {
+		fmt.Printf("Error parsing enums: %v\n", err)
+		os.Exit(1)
+	}
+
 	fmt.Printf("Found %d total tables\n", len(tables))
 
 	if tablePrefix != "" {
@@ -63,6 +76,26 @@ func main() {
 			fmt.Printf("%s.%s\n", table.Schema, table.Name)
 		}
 
+		// Find enums used by filtered tables and whitelisted related tables
+		var tablesToCheckForEnums []Table
+		tablesToCheckForEnums = append(tablesToCheckForEnums, filteredTables...)
+
+		// Add only whitelisted related tables
+		for _, table := range relatedTables {
+			for _, whitelist := range whitelistTables {
+				if strings.EqualFold(table.Name, whitelist) {
+					tablesToCheckForEnums = append(tablesToCheckForEnums, table)
+					break
+				}
+			}
+		}
+
+		usedEnums := findUsedEnums(tablesToCheckForEnums, enums)
+		fmt.Printf("\nFound %d enum types used by filtered tables and whitelisted related tables:\n", len(usedEnums))
+		for _, enum := range usedEnums {
+			fmt.Printf("%s.%s\n", enum.Schema, enum.Name)
+		}
+
 		// Write filtered and related tables to output file
 		outputFile := "filtered_tables.sql"
 		out, err := os.Create(outputFile)
@@ -72,7 +105,17 @@ func main() {
 		}
 		defer out.Close()
 
-		// Write filtered tables first
+		// Write enum definitions first
+		if len(usedEnums) > 0 {
+			fmt.Fprint(out, "-- Enum type definitions\n")
+			for _, enum := range usedEnums {
+				fmt.Fprint(out, enum.SQL)
+			}
+			fmt.Fprint(out, "\n")
+		}
+
+		// Write filtered tables
+		fmt.Fprint(out, "-- Tables with prefix\n")
 		for _, table := range filteredTables {
 			fmt.Fprint(out, table.SQL)
 		}
@@ -89,11 +132,9 @@ func main() {
 			}
 
 			if isWhitelisted {
-				// Write full table definition for whitelisted tables
 				fmt.Fprintf(out, "\n-- Full definition for whitelisted table\n")
 				fmt.Fprint(out, table.SQL)
 			} else {
-				// Write only table name and id column for other related tables
 				createTableLine := regexp.MustCompile(`(?m)^CREATE TABLE.*?\(`).FindString(table.SQL)
 				idLine := regexp.MustCompile(`(?m)^\s*id\s+[^,]+`).FindString(table.SQL)
 				if createTableLine != "" && idLine != "" {
@@ -102,7 +143,10 @@ func main() {
 			}
 		}
 
-		fmt.Printf("\nWrote %d tables to %s\n", len(filteredTables)+len(relatedTables), outputFile)
+		fmt.Printf("\nWrote %d tables and %d enum types to %s\n",
+			len(filteredTables)+len(relatedTables),
+			len(usedEnums),
+			outputFile)
 		if len(whitelistTables) > 0 {
 			fmt.Printf("Included full definitions for whitelisted tables: %v\n", whitelistTables)
 		}
@@ -261,4 +305,67 @@ func parseTables(file *os.File) ([]Table, error) {
 	}
 
 	return tables, nil
+}
+
+func parseEnums(file *os.File) ([]EnumType, error) {
+	var enums []EnumType
+	scanner := bufio.NewScanner(file)
+	var currentEnum *EnumType
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if currentEnum == nil {
+			if strings.Contains(line, "CREATE TYPE") && strings.Contains(line, "AS ENUM") {
+				// Extract schema and name from CREATE TYPE public.some_enum_type AS ENUM
+				parts := strings.Split(strings.Split(line, "AS ENUM")[0], ".")
+				if len(parts) == 2 {
+					schema := strings.TrimSpace(strings.Split(parts[0], "TYPE")[1])
+					name := strings.TrimSpace(parts[1])
+					currentEnum = &EnumType{
+						Schema: schema,
+						Name:   name,
+						SQL:    line + "\n",
+					}
+				}
+			}
+		} else {
+			currentEnum.SQL += line + "\n"
+			if strings.Contains(line, ");") {
+				enums = append(enums, *currentEnum)
+				currentEnum = nil
+			}
+		}
+	}
+
+	return enums, scanner.Err()
+}
+
+func findUsedEnums(tables []Table, allEnums []EnumType) []EnumType {
+	usedEnums := make(map[string]EnumType)
+
+	// Create a pattern that matches schema.type_name that appears after a type declaration
+	enumPattern := regexp.MustCompile(`(?i)public\.[a-zA-Z0-9_]+\b(?:\s+(?:DEFAULT\s+[^:]+::|NOT\s+NULL))?`)
+
+	for _, table := range tables {
+		matches := enumPattern.FindAllString(table.SQL, -1)
+		for _, match := range matches {
+			// Clean up the match to get just the type name
+			typeName := strings.TrimSpace(strings.Split(match, "DEFAULT")[0])
+			typeName = strings.TrimSpace(strings.Split(typeName, "NOT NULL")[0])
+
+			for _, enum := range allEnums {
+				enumFullName := enum.Schema + "." + enum.Name
+				if strings.EqualFold(typeName, enumFullName) {
+					usedEnums[enumFullName] = enum
+				}
+			}
+		}
+	}
+
+	var result []EnumType
+	for _, enum := range usedEnums {
+		result = append(result, enum)
+	}
+	return result
 }
